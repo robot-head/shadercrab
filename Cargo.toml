@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+winit = "0.30"
+wgpu = "23.0"
+bytemuck = { version = "1.21", features = ["derive"] }
+chrono = "0.4"
+pollster = "0.4"
+naga = { version = "23.0", features = ["glsl-in", "wgsl-out"] }
+thiserror = "2.0"
+rfd = "0.15"
+cpal = "0.15"
+image = "0.25"
+
+[lib]
+name = "shadercrab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shadercrab"
+path = "src/main.rs"
