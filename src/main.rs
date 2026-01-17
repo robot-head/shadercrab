@@ -1,5 +1,6 @@
 mod audio;
 mod error;
+mod glsl_interpreter;
 mod glsl_transpiler;
 mod shader_detector;
 mod sound_shader;
@@ -14,7 +15,7 @@ use sound_shader::SoundShader;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use texture::{TextureData, create_wgpu_texture};
+use texture::{TextureData, create_wgpu_texture, create_audio_texture, update_audio_texture};
 use uniforms::Uniforms;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -78,6 +79,8 @@ struct ImageShaderApp {
     mouse: [f32; 4],
     window_size: (u32, u32),
     channel_textures: Vec<wgpu::Texture>,
+    audio_manager: AudioManager,
+    audio_texture: wgpu::Texture,
 }
 
 struct SoundShaderApp {
@@ -140,11 +143,19 @@ impl ImageShaderApp {
         let audio_manager = AudioManager::default();
         let mut uniforms = Uniforms::new(audio_manager.sample_rate);
 
-        // Try to load channel textures from examples folder
-        let mut channel_textures = Vec::new();
-        let mut channel_views = Vec::new();
+        // Create audio texture for iChannel0 (microphone input)
+        let (audio_texture, audio_view) = create_audio_texture(
+            &device,
+            &queue,
+            Some("Audio Texture (iChannel0)"),
+        );
+        uniforms.set_channel_resolution(0, texture::AUDIO_TEXTURE_WIDTH, texture::AUDIO_TEXTURE_HEIGHT);
 
-        for i in 0..4 {
+        // Load channel textures from examples folder (channels 1-3)
+        let mut channel_textures = Vec::new();
+        let mut channel_views = vec![audio_view]; // iChannel0 is audio
+
+        for i in 1..4 {
             let texture_path = format!("examples/channel{}.png", i);
             let texture_data = TextureData::load_from_file(&texture_path)
                 .unwrap_or_else(|_| TextureData::create_default(1, 1));
@@ -365,6 +376,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
             mouse: [0.0, 0.0, 0.0, 0.0],
             window_size: (window_size.width, window_size.height),
             channel_textures,
+            audio_manager,
+            audio_texture,
         })
     }
 
@@ -400,6 +413,15 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     fn render(&mut self) -> Result<()> {
         // Channel textures are kept alive for shader binding
         let _ = &self.channel_textures;
+
+        // Update audio texture with microphone input
+        if self.audio_manager.has_audio_input() {
+            if let Ok(buffer) = self.audio_manager.audio_buffer.lock() {
+                if !buffer.is_empty() {
+                    update_audio_texture(&self.queue, &self.audio_texture, &buffer);
+                }
+            }
+        }
 
         self.uniforms.update(
             self.start_time,
@@ -645,6 +667,9 @@ impl App {
         match std::fs::read_to_string(&path) {
             Ok(shader_source) => match detect_shader_type(&shader_source) {
                 Ok(ShaderType::Image) => {
+                    // Drop the old app first to release the surface
+                    self.app = None;
+                    
                     match pollster::block_on(ImageShaderApp::new(window, &shader_source)) {
                         Ok(new_app) => {
                             self.app = Some(ShaderApp::Image(Box::new(new_app)));
@@ -656,16 +681,21 @@ impl App {
                         }
                     }
                 }
-                Ok(ShaderType::Sound) => match SoundShaderApp::new(&shader_source) {
-                    Ok(new_app) => {
-                        self.app = Some(ShaderApp::Sound(Box::new(new_app)));
-                        self.showing_welcome = false;
-                        println!("Sound shader loaded successfully!");
+                Ok(ShaderType::Sound) => {
+                    // Drop the old app first
+                    self.app = None;
+                    
+                    match SoundShaderApp::new(&shader_source) {
+                        Ok(new_app) => {
+                            self.app = Some(ShaderApp::Sound(Box::new(new_app)));
+                            self.showing_welcome = false;
+                            println!("Sound shader loaded successfully!");
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to start sound shader: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to start sound shader: {}", e);
-                    }
-                },
+                }
                 Err(e) => {
                     eprintln!("Failed to detect shader type: {}", e);
                 }

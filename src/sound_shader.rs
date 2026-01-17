@@ -1,134 +1,78 @@
-/// Simple GLSL sound shader executor
+/// GLSL sound shader interpreter
 /// Parses and executes mainSound() GLSL code on CPU for real-time audio generation
 use crate::error::{Result, ShaderCrabError};
+use crate::glsl_interpreter::GlslInterpreter;
+use naga::front::glsl::{Frontend, Options};
+use naga::Module;
 
 /// Represents a compiled sound shader that can generate audio samples
 pub struct SoundShader {
-    /// The compiled shader function
-    generator: Box<dyn Fn(f32) -> [f32; 2] + Send>,
+    /// The parsed Naga module
+    module: Module,
 }
 
 impl SoundShader {
     /// Parse and compile a GLSL mainSound shader
     pub fn from_glsl(source: &str) -> Result<Self> {
-        // Extract the mainSound function body
-        let body = extract_main_sound_body(source)?;
+        // Wrap the user code with the necessary boilerplate
+        let wrapped = wrap_sound_shader(source);
 
-        // For now, we'll use a simple approach: detect common patterns
-        // In the future, this could be expanded to a full GLSL parser/interpreter
+        // Parse with Naga
+        let options = Options::from(naga::ShaderStage::Fragment);
+        let mut frontend = Frontend::default();
 
-        if body.contains("sin") && body.contains("440") {
-            // Detected the example sine wave pattern
-            Ok(Self::create_sine_wave(440.0, 0.3))
-        } else if body.contains("sin") {
-            // Generic sine wave - try to extract frequency
-            let freq = extract_frequency(&body).unwrap_or(440.0);
-            let volume = extract_volume(&body).unwrap_or(0.3);
-            Ok(Self::create_sine_wave(freq, volume))
-        } else {
-            // Fallback to simple sine wave
-            eprintln!("Warning: Could not parse sound shader, using default 440Hz sine wave");
-            Ok(Self::create_sine_wave(440.0, 0.3))
+        let module = frontend.parse(&options, &wrapped).map_err(|errors| {
+            let error_msg = errors
+                .errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ShaderCrabError::GlslTranspileError(format!("GLSL parse error: {}", error_msg))
+        })?;
+
+        // Verify mainSound function exists
+        let has_main_sound = module
+            .functions
+            .iter()
+            .any(|(_, f)| f.name.as_deref() == Some("mainSound"));
+
+        if !has_main_sound {
+            return Err(ShaderCrabError::GlslTranspileError(
+                "mainSound function not found in shader".to_string(),
+            ));
         }
-    }
 
-    /// Create a sine wave generator
-    fn create_sine_wave(frequency: f32, volume: f32) -> Self {
-        Self {
-            generator: Box::new(move |time| {
-                let wave = (time * frequency * 2.0 * std::f32::consts::PI).sin() * volume;
-                [wave, wave]
-            }),
-        }
+        Ok(Self { module })
     }
 
     /// Generate audio samples for the given time
     pub fn generate(&self, time: f32) -> [f32; 2] {
-        (self.generator)(time)
+        let mut interpreter = GlslInterpreter::new(&self.module);
+        interpreter.call_main_sound(time)
     }
 }
 
-/// Extract the body of the mainSound function
-fn extract_main_sound_body(source: &str) -> Result<String> {
-    // Find mainSound function
-    let start = source
-        .find("vec2 mainSound")
-        .or_else(|| source.find("vec2mainSound"))
-        .ok_or_else(|| {
-            ShaderCrabError::GlslTranspileError("Could not find mainSound function".to_string())
-        })?;
+/// Wrap user sound shader code with GLSL boilerplate
+fn wrap_sound_shader(user_code: &str) -> String {
+    format!(
+        r#"#version 450
 
-    // Find the opening brace
-    let body_start = source[start..].find('{').ok_or_else(|| {
-        ShaderCrabError::GlslTranspileError("Could not find mainSound function body".to_string())
-    })?;
+// Shadertoy-compatible uniforms (available but may not be used)
+const float PI = 3.14159265359;
 
-    // Find the matching closing brace
-    let mut depth = 0;
-    let mut body_end = None;
+layout(location = 0) out vec2 outAudio;
 
-    for (i, ch) in source[start + body_start..].chars().enumerate() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    body_end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
+{}
 
-    let body_end = body_end.ok_or_else(|| {
-        ShaderCrabError::GlslTranspileError("Could not find end of mainSound function".to_string())
-    })?;
-
-    let body = &source[start + body_start..start + body_start + body_end + 1];
-    Ok(body.to_string())
-}
-
-/// Try to extract frequency value from shader code
-fn extract_frequency(code: &str) -> Option<f32> {
-    // Look for patterns like "frequency = 440.0" or direct usage like "* 440.0"
-    for line in code.lines() {
-        if line.contains("frequency") && line.contains('=') {
-            // Extract the number after =
-            if let Some(after_eq) = line.split('=').nth(1) {
-                let num_str: String = after_eq
-                    .chars()
-                    .skip_while(|c| c.is_whitespace())
-                    .take_while(|c| c.is_numeric() || *c == '.')
-                    .collect();
-                if let Ok(freq) = num_str.parse::<f32>() {
-                    return Some(freq);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Try to extract volume value from shader code
-fn extract_volume(code: &str) -> Option<f32> {
-    // Look for patterns like "* 0.3" or "envelope * 0.3"
-    for line in code.lines() {
-        if line.contains("envelope")
-            && line.contains('*')
-            && let Some(after_star) = line.split('*').next_back()
-        {
-            let num_str: String = after_star
-                .chars()
-                .skip_while(|c| c.is_whitespace())
-                .take_while(|c| c.is_numeric() || *c == '.')
-                .collect();
-            if let Ok(vol) = num_str.trim().parse::<f32>() {
-                return Some(vol);
-            }
-        }
-    }
-    None
+void main() {{
+    // Dummy entry point - we don't actually use this
+    // The interpreter directly calls mainSound
+    outAudio = vec2(0.0, 0.0);
+}}
+"#,
+        user_code
+    )
 }
 
 #[cfg(test)]
@@ -136,27 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_main_sound_body() {
-        let glsl = r#"
-vec2 mainSound(float time) {
-    float frequency = 440.0;
-    return vec2(sin(time * frequency), 0.0);
-}
-"#;
-        let body = extract_main_sound_body(glsl).unwrap();
-        assert!(body.contains("frequency = 440.0"));
-        assert!(body.contains("return vec2"));
-    }
-
-    #[test]
-    fn test_extract_frequency() {
-        let code = "float frequency = 440.0;";
-        let freq = extract_frequency(code);
-        assert_eq!(freq, Some(440.0));
-    }
-
-    #[test]
-    fn test_sound_shader_creation() {
+    fn test_simple_sine_wave() {
         let glsl = r#"
 vec2 mainSound(float time) {
     float frequency = 440.0;
@@ -165,13 +89,140 @@ vec2 mainSound(float time) {
 }
 "#;
         let shader = SoundShader::from_glsl(glsl).unwrap();
+
+        // Test at time 0 - sin(0) = 0
         let samples = shader.generate(0.0);
-        assert_eq!(samples[0], samples[1]); // Stereo should match
+        assert!(samples[0].abs() < 0.001, "Expected ~0, got {}", samples[0]);
+
+        // Test at time where we expect a peak
+        // sin(2*pi*440*t) = 1 when t = 1/(4*440) = 0.000568...
+        let t = 1.0 / (4.0 * 440.0);
+        let samples = shader.generate(t);
+        assert!(
+            (samples[0] - 1.0).abs() < 0.01,
+            "Expected ~1, got {}",
+            samples[0]
+        );
     }
 
     #[test]
-    fn test_sound_shader_output_range() {
-        let shader = SoundShader::create_sine_wave(440.0, 0.3);
+    fn test_stereo_output() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    return vec2(0.5, -0.5);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+        let samples = shader.generate(0.0);
+        assert_eq!(samples[0], 0.5);
+        assert_eq!(samples[1], -0.5);
+    }
+
+    #[test]
+    fn test_with_smoothstep() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float envelope = smoothstep(0.0, 0.1, time);
+    float wave = sin(time * 440.0 * 2.0 * 3.14159) * envelope;
+    return vec2(wave, wave);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+
+        // At time 0, envelope should be 0
+        let samples = shader.generate(0.0);
+        assert!(samples[0].abs() < 0.001);
+
+        // At time 0.1, envelope should be 1
+        let samples = shader.generate(0.1);
+        // The wave value depends on the phase, just verify it's non-zero scaled
+        assert!(samples[0].abs() <= 1.0);
+    }
+
+    #[test]
+    fn test_with_mod() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float t = mod(time, 1.0);
+    return vec2(t, t);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+
+        let samples = shader.generate(0.5);
+        assert!((samples[0] - 0.5).abs() < 0.001);
+
+        let samples = shader.generate(1.5);
+        assert!((samples[0] - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_with_mix() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float a = 0.0;
+    float b = 1.0;
+    float result = mix(a, b, 0.5);
+    return vec2(result, result);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+        let samples = shader.generate(0.0);
+        assert!((samples[0] - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_with_clamp() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float value = clamp(time * 10.0, 0.0, 1.0);
+    return vec2(value, value);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+
+        let samples = shader.generate(0.0);
+        assert_eq!(samples[0], 0.0);
+
+        let samples = shader.generate(0.05);
+        assert!((samples[0] - 0.5).abs() < 0.001);
+
+        let samples = shader.generate(1.0);
+        assert_eq!(samples[0], 1.0);
+    }
+
+    #[test]
+    fn test_with_conditionals() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float wave;
+    if (time < 0.5) {
+        wave = 0.25;
+    } else {
+        wave = 0.75;
+    }
+    return vec2(wave, wave);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+
+        let samples = shader.generate(0.25);
+        assert!((samples[0] - 0.25).abs() < 0.001);
+
+        let samples = shader.generate(0.75);
+        assert!((samples[0] - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_output_range() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float frequency = 440.0;
+    float wave = sin(time * frequency * 2.0 * 3.14159) * 0.3;
+    return vec2(wave, wave);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
 
         // Test multiple time points
         for i in 0..100 {
@@ -182,5 +233,23 @@ vec2 mainSound(float time) {
             assert!(samples[0] >= -1.0 && samples[0] <= 1.0);
             assert!(samples[1] >= -1.0 && samples[1] <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_multiple_oscillators() {
+        let glsl = r#"
+vec2 mainSound(float time) {
+    float freq1 = 440.0;
+    float freq2 = 880.0;
+    float wave1 = sin(time * freq1 * 6.28318);
+    float wave2 = sin(time * freq2 * 6.28318);
+    float mixed = (wave1 + wave2) * 0.25;
+    return vec2(mixed, mixed);
+}
+"#;
+        let shader = SoundShader::from_glsl(glsl).unwrap();
+        let samples = shader.generate(0.001);
+        // Just verify it runs and produces reasonable output
+        assert!(samples[0].abs() <= 1.0);
     }
 }
